@@ -1,0 +1,989 @@
+# FILE: app/__init__.py
+__version__ = "1.0.0"
+
+# FILE: app/config.py
+from typing import List
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
+    APP_NAME: str = "PayCore"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    DATABASE_URL: str
+    REDIS_URL: str
+    REDIS_STREAM_NAME: str = "paycore:transactions"
+    REDIS_CONSUMER_GROUP: str = "paycore-workers"
+
+    MAX_WORKERS: int = 4
+    DB_POOL_SIZE: int = 20
+    DB_MAX_OVERFLOW: int = 40
+    REDIS_POOL_SIZE: int = 10
+    BATCH_SIZE: int = 100
+
+    RATE_LIMIT_PER_MINUTE: int = 1000
+
+    CORS_ORIGINS: List[str] = ["*"]
+
+
+settings = Settings()
+
+# FILE: app/database.py
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
+
+from app.config import settings
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=settings.DEBUG,
+    connect_args={"options": "-c timezone=utc"},
+)
+
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+
+@contextmanager
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+# FILE: app/models.py
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
+
+from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_number = Column(String, unique=True, nullable=False, index=True)
+    balance_cents = Column(Integer, default=0, nullable=False)
+    currency = Column(String, default="USD", nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    sender_account_id = Column(
+        String, ForeignKey("accounts.id"), nullable=False, index=True
+    )
+    receiver_account_id = Column(
+        String, ForeignKey("accounts.id"), nullable=False, index=True
+    )
+    amount_cents = Column(Integer, nullable=False)
+    currency = Column(String, default="USD", nullable=False)
+    status = Column(String, default="pending", nullable=False, index=True)
+    transaction_type = Column(String, default="transfer", nullable=False)
+    description = Column(Text, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+    idempotency_key = Column(String, unique=True, index=True, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
+    failure_reason = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_sender_created", "sender_account_id", "created_at"),
+        Index("idx_receiver_created", "receiver_account_id", "created_at"),
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    transaction_id = Column(
+        String, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id = Column(
+        String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    action = Column(String, nullable=False)
+    details_json = Column(Text, nullable=True)
+    ip_address = Column(String, nullable=True)
+    timestamp = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+# FILE: app/schemas.py
+import re
+from datetime import datetime
+from typing import Dict, Optional
+
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+
+class TransactionCreate(BaseModel):
+    sender_account_id: str
+    receiver_account_id: str
+    amount_cents: int = Field(..., gt=0)
+    currency: str = "USD"
+    transaction_type: str = "transfer"
+    description: Optional[str] = None
+    metadata: Optional[Dict] = None
+    idempotency_key: Optional[str] = None
+
+
+class TransactionResponse(BaseModel):
+    id: str
+    sender_account_id: str
+    receiver_account_id: str
+    amount_cents: int
+    currency: str
+    status: str
+    transaction_type: str
+    description: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+    failed_at: Optional[datetime]
+    failure_reason: Optional[str]
+
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long.")
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain at least one uppercase letter.")
+        if not re.search(r"[a-z]", v):
+            raise ValueError("Password must contain at least one lowercase letter.")
+        if not re.search(r"\d", v):
+            raise ValueError("Password must contain at least one digit.")
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", v):
+            raise ValueError("Password must contain at least one special character.")
+        return v
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    username: str
+    email: str
+    created_at: datetime
+
+
+class AccountCreate(BaseModel):
+    currency: str = "USD"
+
+
+class BalanceResponse(BaseModel):
+    account_id: str
+    balance_cents: int
+    currency: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# FILE: app/auth.py
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
+from app.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[int] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=expires_delta or settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_access_token(token: str) -> Optional[dict]:
+    try:
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except JWTError:
+        return None
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+) -> User:
+    payload = decode_access_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user_id: str = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or inactive",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+# FILE: app/middleware.py
+import time
+import logging
+from collections import defaultdict
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+from app.config import settings
+
+logger = logging.getLogger("paycore.middleware")
+
+# Basit in-memory rate limiting (tek worker / demo için).
+# Gerçek prodüksiyonda Redis tabanlı yapılmalı.
+rate_limit_store = defaultdict(list)
+
+
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host
+    now = time.time()
+
+    rate_limit_store[client_ip] = [
+        t for t in rate_limit_store[client_ip] if now - t < 60
+    ]
+    if len(rate_limit_store[client_ip]) >= settings.RATE_LIMIT_PER_MINUTE:
+        return JSONResponse(
+            status_code=429, content={"detail": "Too many requests"}
+        )
+    rate_limit_store[client_ip].append(now)
+    return await call_next(request)
+
+
+async def logging_middleware(request: Request, call_next):
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        logger.error(f"Request error: {e}", exc_info=True)
+        raise
+    process_time = time.time() - start_time
+    logger.info(
+        f"{request.method} {request.url.path} - {response.status_code} - {process_time:.4f}s"
+    )
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
+
+# FILE: app/engine/__init__.py
+from app.engine.core import engine, TransactionTask
+
+__all__ = ["engine", "TransactionTask"]
+
+# FILE: app/engine/core.py
+import asyncio
+import json
+import logging
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Dict, List
+
+import redis.asyncio as redis
+from sqlalchemy.orm import Session
+
+from app.database import SessionLocal
+from app.models import Account, AuditLog, Transaction
+from app.config import settings
+
+logger = logging.getLogger("paycore.engine")
+
+
+@dataclass
+class TransactionTask:
+    sender_account_id: str
+    receiver_account_id: str
+    amount_cents: int
+    currency: str
+    transaction_type: str
+    description: str
+    metadata: Dict
+    idempotency_key: str
+    created_at: str
+
+
+class TransactionEngine:
+    def __init__(self):
+        self.redis: redis.Redis = None
+        self.running = False
+
+    async def connect(self):
+        self.redis = redis.from_url(
+            settings.REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            max_connections=settings.REDIS_POOL_SIZE,
+        )
+        await self._ensure_consumer_group()
+        logger.info("Transaction engine connected to Redis")
+
+    async def _ensure_consumer_group(self):
+        try:
+            await self.redis.xgroup_create(
+                settings.REDIS_STREAM_NAME,
+                settings.REDIS_CONSUMER_GROUP,
+                id="0",
+                mkstream=True,
+            )
+        except Exception:
+            # Group zaten varsa hata verir, görmezden geliyoruz.
+            pass
+
+    async def disconnect(self):
+        if self.redis:
+            await self.redis.close()
+        self.running = False
+        logger.info("Transaction engine disconnected")
+
+    async def submit_transaction(self, task: TransactionTask) -> str:
+        transaction_id = task.idempotency_key or str(time.time_ns())
+        payload = {"transaction_id": transaction_id, **asdict(task)}
+        await self.redis.xadd(settings.REDIS_STREAM_NAME, payload)
+        logger.info(f"Transaction {transaction_id} queued")
+        return transaction_id
+
+    async def start_processing(self):
+        self.running = True
+        logger.info("Transaction engine started")
+        while self.running:
+            try:
+                messages = await self.redis.xreadgroup(
+                    groupname=settings.REDIS_CONSUMER_GROUP,
+                    consumername="worker-1",
+                    streams={settings.REDIS_STREAM_NAME: ">"},
+                    count=settings.BATCH_SIZE,
+                    block=1000,
+                )
+                if not messages:
+                    continue
+                stream_name, entries = messages[0]
+                batch = [(entry_id, fields) for entry_id, fields in entries]
+                if batch:
+                    await self._process_batch(batch)
+            except Exception as e:
+                logger.error(f"Engine error: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
+    async def _process_batch(self, batch: List[tuple]):
+        db: Session = SessionLocal()
+        try:
+            for entry_id, fields in batch:
+                await self._process_single(db, fields, entry_id)
+            db.commit()
+            logger.info(f"Batch processed: {len(batch)} transactions")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Batch failed: {e}", exc_info=True)
+            # Hata durumunda mesajı tekrar eklemiyoruz; manuel inceleme için
+            # stream'de kalması daha güvenli.
+        finally:
+            db.close()
+
+    async def _process_single(
+        self, db: Session, fields: Dict, entry_id: str
+    ) -> None:
+        transaction_id = fields["transaction_id"]
+
+        existing = db.query(Transaction).filter(
+            Transaction.idempotency_key == fields.get("idempotency_key")
+        ).first()
+        if existing:
+            logger.info(f"Duplicate transaction: {transaction_id}")
+            await self.redis.xack(
+                settings.REDIS_STREAM_NAME,
+                settings.REDIS_CONSUMER_GROUP,
+                entry_id,
+            )
+            return
+
+        transaction = Transaction(
+            id=transaction_id,
+            sender_account_id=fields["sender_account_id"],
+            receiver_account_id=fields["receiver_account_id"],
+            amount_cents=int(fields["amount_cents"]),
+            currency=fields["currency"],
+            status="processing",
+            transaction_type=fields["transaction_type"],
+            description=fields.get("description"),
+            metadata_json=json.dumps(fields.get("metadata", {})),
+            idempotency_key=fields.get("idempotency_key"),
+        )
+        db.add(transaction)
+        db.flush()
+
+        sender = (
+            db.query(Account)
+            .filter(Account.id == fields["sender_account_id"])
+            .with_for_update()
+            .first()
+        )
+        receiver = (
+            db.query(Account)
+            .filter(Account.id == fields["receiver_account_id"])
+            .with_for_update()
+            .first()
+        )
+
+        if not sender or not receiver:
+            transaction.status = "failed"
+            transaction.failure_reason = "Account not found"
+            transaction.failed_at = datetime.now(timezone.utc)
+            await self.redis.xack(
+                settings.REDIS_STREAM_NAME,
+                settings.REDIS_CONSUMER_GROUP,
+                entry_id,
+            )
+            return
+
+        if sender.balance_cents < int(fields["amount_cents"]):
+            transaction.status = "failed"
+            transaction.failure_reason = "Insufficient balance"
+            transaction.failed_at = datetime.now(timezone.utc)
+            await self.redis.xack(
+                settings.REDIS_STREAM_NAME,
+                settings.REDIS_CONSUMER_GROUP,
+                entry_id,
+            )
+            return
+
+        sender.balance_cents -= int(fields["amount_cents"])
+        receiver.balance_cents += int(fields["amount_cents"])
+        receiver.updated_at = datetime.now(timezone.utc)
+
+        transaction.status = "completed"
+        transaction.completed_at = datetime.now(timezone.utc)
+
+        audit = AuditLog(
+            transaction_id=transaction.id,
+            user_id=sender.user_id,
+            action="transaction_completed",
+            details_json=json.dumps(
+                {
+                    "amount_cents": int(fields["amount_cents"]),
+                    "sender": fields["sender_account_id"],
+                    "receiver": fields["receiver_account_id"],
+                }
+            ),
+        )
+        db.add(audit)
+
+        await self.redis.xack(
+            settings.REDIS_STREAM_NAME,
+            settings.REDIS_CONSUMER_GROUP,
+            entry_id,
+        )
+        logger.info(f"Transaction {transaction_id} completed")
+
+
+engine = TransactionEngine()
+
+# FILE: app/api/__init__.py
+from app.api import auth, users, accounts, transactions
+
+__all__ = ["auth", "users", "accounts", "transactions"]
+
+# FILE: app/api/auth.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
+from app.schemas import UserCreate, LoginRequest, Token, UserResponse
+from app.auth import verify_password, get_password_hash, create_access_token
+from app.config import settings
+
+router = APIRouter()
+
+
+@router.post(
+    "/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED
+)
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing = (
+        db.query(User)
+        .filter((User.username == user.username) | (User.email == user.email))
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists"
+        )
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=get_password_hash(user.password),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@router.post("/login", response_model=Token)
+async def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == credentials.username).first()
+    if not user or not verify_password(credentials.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+        )
+    access_token = create_access_token(
+        data={"sub": user.id}, expires_delta=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# FILE: app/api/users.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
+from app.schemas import UserCreate, UserResponse
+from app.auth import get_current_user, get_password_hash
+
+router = APIRouter()
+
+
+@router.post(
+    "/", response_model=UserResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    existing = (
+        db.query(User)
+        .filter((User.username == user.username) | (User.email == user.email))
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists"
+        )
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=get_password_hash(user.password),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return current_user
+
+# FILE: app/api/accounts.py
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Account, User
+from app.schemas import AccountCreate, BalanceResponse
+from app.auth import get_current_user
+
+router = APIRouter()
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def create_account(
+    account: AccountCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Hesap her zaman giriş yapan kullanıcıya ait olur.
+    new_account = Account(
+        user_id=current_user.id,
+        account_number=str(uuid.uuid4()),
+        currency=account.currency,
+    )
+    db.add(new_account)
+    db.commit()
+    db.refresh(new_account)
+    return {
+        "account_id": new_account.id,
+        "account_number": new_account.account_number,
+        "user_id": new_account.user_id,
+        "balance_cents": new_account.balance_cents,
+        "currency": new_account.currency,
+    }
+
+
+@router.get("/{account_id}/balance", response_model=BalanceResponse)
+async def get_balance(
+    account_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    account = (
+        db.query(Account)
+        .filter(Account.id == account_id, Account.user_id == current_user.id)
+        .first()
+    )
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Account not found"
+        )
+    return BalanceResponse(
+        account_id=account.id,
+        balance_cents=account.balance_cents,
+        currency=account.currency,
+    )
+
+# FILE: app/api/transactions.py
+import time
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Account, Transaction, User
+from app.schemas import TransactionCreate, TransactionResponse
+from app.auth import get_current_user
+from app.engine.core import TransactionTask, engine
+
+router = APIRouter()
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def create_transaction(
+    transaction: TransactionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if transaction.idempotency_key:
+        existing = (
+            db.query(Transaction)
+            .filter(Transaction.idempotency_key == transaction.idempotency_key)
+            .first()
+        )
+        if existing:
+            return TransactionResponse(
+                id=existing.id,
+                sender_account_id=existing.sender_account_id,
+                receiver_account_id=existing.receiver_account_id,
+                amount_cents=existing.amount_cents,
+                currency=existing.currency,
+                status=existing.status,
+                transaction_type=existing.transaction_type,
+                description=existing.description,
+                created_at=existing.created_at,
+                completed_at=existing.completed_at,
+                failed_at=existing.failed_at,
+                failure_reason=existing.failure_reason,
+            )
+
+    sender = db.query(Account).filter(
+        Account.id == transaction.sender_account_id
+    ).first()
+    receiver = db.query(Account).filter(
+        Account.id == transaction.receiver_account_id
+    ).first()
+
+    if not sender or not receiver:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid account(s)"
+        )
+
+    task = TransactionTask(
+        sender_account_id=transaction.sender_account_id,
+        receiver_account_id=transaction.receiver_account_id,
+        amount_cents=transaction.amount_cents,
+        currency=transaction.currency,
+        transaction_type=transaction.transaction_type,
+        description=transaction.description or "",
+        metadata=transaction.metadata or {},
+        idempotency_key=transaction.idempotency_key or str(time.time_ns()),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    transaction_id = await engine.submit_transaction(task)
+    return {
+        "transaction_id": transaction_id,
+        "status": "queued",
+        "message": "Transaction queued for processing",
+    }
+
+
+@router.get("/{transaction_id}", response_model=TransactionResponse)
+async def get_transaction(
+    transaction_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    transaction = (
+        db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    )
+    if not transaction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found"
+        )
+    return TransactionResponse(
+        id=transaction.id,
+        sender_account_id=transaction.sender_account_id,
+        receiver_account_id=transaction.receiver_account_id,
+        amount_cents=transaction.amount_cents,
+        currency=transaction.currency,
+        status=transaction.status,
+        transaction_type=transaction.transaction_type,
+        description=transaction.description,
+        created_at=transaction.created_at,
+        completed_at=transaction.completed_at,
+        failed_at=transaction.failed_at,
+        failure_reason=transaction.failure_reason,
+    )
+
+# FILE: app/main.py
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.database import engine, Base
+from app.engine.core import engine as transaction_engine
+from app.middleware import rate_limit_middleware, logging_middleware
+from app.api import auth, users, accounts, transactions
+
+logging.basicConfig(
+    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("paycore")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("PayCore starting up...")
+    Base.metadata.create_all(bind=engine)
+    await transaction_engine.connect()
+    asyncio.create_task(transaction_engine.start_processing())
+    logger.info("PayCore started successfully")
+    yield
+    logger.info("PayCore shutting down...")
+    await transaction_engine.disconnect()
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.middleware("http")(logging_middleware)
+app.middleware("http")(rate_limit_middleware)
+
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(users.router, prefix="/users", tags=["users"])
+app.include_router(accounts.router, prefix="/accounts", tags=["accounts"])
+app.include_router(
+    transactions.router, prefix="/transactions", tags=["transactions"]
+)
+
+
+@app.get("/")
+async def root():
+    return {
+        "name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "operational",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+# FILE: requirements.txt
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+gunicorn==21.2.0
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[crypto]==3.3.4
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+email-validator==2.1.0
+
+# FILE: .env.example
+APP_NAME=PayCore
+APP_VERSION=1.0.0
+DEBUG=false
+
+SECRET_KEY=your-super-secret-key-min-32-chars-change-this-in-production
+
+DATABASE_URL=postgresql://user:pass@localhost:5432/paycore
+REDIS_URL=redis://localhost:6379/0
+
+REDIS_STREAM_NAME=paycore:transactions
+REDIS_CONSUMER_GROUP=paycore-workers
+
+MAX_WORKERS=4
+DB_POOL_SIZE=20
+REDIS_POOL_SIZE=10
+BATCH_SIZE=100
+
+RATE_LIMIT_PER_MINUTE=1000
+CORS_ORIGINS=["*"]
+
+# FILE: .gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.local
+.env.*.local
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.log
+logs/
+*.db
+*.sqlite
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.DS_Store
+Thumbs.db
+alembic/versions/*.pyc

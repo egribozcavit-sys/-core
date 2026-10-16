@@ -27,3 +27,4 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and set SECRET_KEY (min 32 chars)
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+ 

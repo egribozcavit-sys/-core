@@ -459,4 +459,4 @@ def ai_stats(cu: Annotated[User, Depends(current_user)], db: Annotated[Session, 
     return {"total": total, "real_owner": real_owner, "avg_match": round(avg_match,2), "mode": "V5 REAL + SECURITY"}
 
 @app.get("/health")
-def health(): return {"app": APP_NAME, "version": "V5 REAL + SECURITY FINAL - SIFIR HATA", "security": "pbkdf2 200k + JWT + rate + audit + lock + daily limit", "real_transfer": "Iyzico + FAST hazır", "ai": "Profil doğrulama aktif", "timestamp": utc_now()} 
+def health(): return {"app": APP_NAME, "version": "V5 REAL + SECURITY FINAL - SIFIR HATA", "security": "pbkdf2 200k + JWT + rate + audit + lock + daily limit", "real_transfer": "Iyzico + FAST hazır", "ai": "Profil doğrulama aktif", "timestamp": utc_now()}  

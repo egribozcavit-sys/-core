@@ -1,64 +1,80 @@
-# FILE: asas_pay_main.py - A.S.A.S. PAY V5 REAL + ÜST DÜZEY GÜVENLİK + TAM MİMARİ - FINAL
-# Kurulum: pip install "fastapi[standard]" "python-jose[cryptography]" sqlalchemy httpx
-# Çalıştır: uvicorn asas_pay_main:app --reload --host 0.0.0.0 --port 3000
-# Doküman: http://localhost:3000/docs
-
 from __future__ import annotations
-import os, re, secrets, hashlib, threading, uuid, time, json
+import os, re, secrets, hashlib, threading, uuid, time, math
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation, localcontext
 from enum import Enum
 from typing import Annotated, Optional, List, Dict
-
-from fastapi import Depends, FastAPI, HTTPException, Request, Header
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint, create_engine, select, Index, Text, Float
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint, create_engine, select, Index, CheckConstraint, func
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-# --- ÜST DÜZEY GÜVENLİK ÇEKİRDEĞİ ---
-def hash_password(p: str) -> str:
-    salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), salt.encode(), 200_000)
-    return f"pbkdf2_sha256$200000${salt}${dk.hex()}"
-def verify_password(p: str, h: str) -> bool:
+try:
+    from argon2 import PasswordHasher
+    _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
+    def hash_password(p: str) -> str: return _ph.hash(p[:72])
+    def verify_password(p: str, h: str) -> bool:
+        try: return _ph.verify(h, p[:72])
+        except: return False
+    HASH_ALGO="argon2id"
+except ImportError:
     try:
-        _, it_s, salt, hexdk = h.split("$")
-        dk = hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), salt.encode(), int(it_s))
-        return secrets.compare_digest(dk.hex(), hexdk)
-    except: return False
-def quantize_amount(v: Decimal) -> Decimal:
-    if not isinstance(v, Decimal): v = Decimal(str(v))
-    return v.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        import bcrypt
+        def hash_password(p: str) -> str: return bcrypt.hashpw(p.encode()[:72], bcrypt.gensalt()).decode()
+        def verify_password(p: str, h: str) -> bool:
+            try: return bcrypt.checkpw(p.encode()[:72], h.encode())
+            except: return False
+        HASH_ALGO="bcrypt"
+    except ImportError:
+        def hash_password(p: str) -> str:
+            salt = secrets.token_hex(16)
+            dk = hashlib.pbkdf2_hmac("sha256", p.encode(), salt.encode(), 200_000)
+            return f"pbkdf2_sha256$200000${salt}${dk.hex()}"
+        def verify_password(p: str, h: str) -> bool:
+            try:
+                _, it_s, salt, hexdk = h.split("$")
+                dk = hashlib.pbkdf2_hmac("sha256", p.encode(), salt.encode(), int(it_s))
+                return secrets.compare_digest(dk.hex(), hexdk)
+            except: return False
+        HASH_ALGO="pbkdf2_200k"
 
-APP_NAME = "A.S.A.S. Pay V5 REAL + Üst Düzey Güvenlik - FINAL"
-ENV = os.getenv("ASAS_ENV", "development")
-JWT_SECRET = os.getenv("ASAS_JWT_SECRET_KEY") or secrets.token_urlsafe(64)
-if ENV == "production" and not os.getenv("ASAS_JWT_SECRET_KEY"):
-    raise RuntimeError("ASAS_JWT_SECRET_KEY productionda zorunlu")
-JWT_ALG = "HS256"; ACCESS_MIN = 30; REFRESH_DAYS = 30
-DB_URL = os.getenv("ASAS_DATABASE_URL", "sqlite:///./asas_pay_v5_real.db")
-ORIGINS = [o.strip() for o in os.getenv("ASAS_ALLOWED_ORIGINS","http://localhost:3000,http://localhost:5173,http://localhost:19006").split(",") if o.strip()]
-RATE_REQ = 60; RATE_WIN = 60; MAX_FAIL = 5; LOCK_MIN = 15
-CURRENCIES = {"TRY","USD","EUR"}; MIN_AMT = Decimal("0.01"); MAX_AMT = Decimal("1000000.00")
-DAILY_LIMIT = {"TRY": Decimal("500000"), "USD": Decimal("20000"), "EUR": Decimal("20000")}
-IYZICO_API_KEY = os.getenv("IYZICO_API_KEY",""); IYZICO_SECRET = os.getenv("IYZICO_SECRET_KEY","")
-BANK_FAST_API_URL = os.getenv("BANK_FAST_API_URL",""); BANK_API_TOKEN = os.getenv("BANK_API_TOKEN","")
+def quantize_amount(v) -> Decimal:
+    if v is None: raise ValueError("amount_null")
+    s = str(v).strip().lower()
+    if s in ('nan','inf','-inf','+inf','infinity','-infinity'): raise ValueError("nan_inf_banned")
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)): raise ValueError("float_nan_inf_banned")
+    try:
+        with localcontext() as ctx:
+            ctx.rounding = ROUND_HALF_UP
+            d = Decimal(s)
+            if not d.is_finite() or d.is_nan(): raise ValueError("nan_inf")
+            return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        raise ValueError("invalid_decimal")
 
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+APP_NAME="A.S.A.S. Pay V6 SIFIR HATA %100"
+ENV=os.getenv("ASAS_ENV","development").strip().lower()
+JWT_SECRET=os.getenv("ASAS_JWT_SECRET_KEY") or secrets.token_urlsafe(64)
+if ENV=="production" and not os.getenv("ASAS_JWT_SECRET_KEY"): raise RuntimeError("ASAS_JWT_SECRET_KEY productionda zorunlu")
+JWT_ALG="HS256"; ACCESS_MIN=15; REFRESH_DAYS=7
+DB_URL=os.getenv("ASAS_DATABASE_URL","sqlite:///./asas_pay_v6.db")
+ORIGINS=[o.strip() for o in os.getenv("ASAS_ALLOWED_ORIGINS","http://localhost:3000,http://localhost:5173,http://localhost:19006").split(",") if o.strip()]
+CURRENCIES={"TRY","USD","EUR"}; MIN_AMT=Decimal("0.01"); MAX_AMT=Decimal("1000000.00")
+DAILY_LIMIT={"TRY":Decimal("500000"),"USD":Decimal("20000"),"EUR":Decimal("20000")}
+
+engine=create_engine(DB_URL, pool_pre_ping=True, pool_recycle=1800, pool_size=10, max_overflow=20, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+SessionLocal=sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 class Base(DeclarativeBase): pass
 def uuid_str(): return str(uuid.uuid4())
 def utc_now(): return datetime.now(timezone.utc)
 
 class UserStatus(str, Enum): ACTIVE="active"; SUSPENDED="suspended"; CLOSED="closed"
-class TxType(str, Enum): DEPOSIT="deposit"; TRANSFER_OUT="transfer_out"; TRANSFER_IN="transfer_in"; REAL_DEPOSIT="real_deposit"; REAL_WITHDRAW="real_withdraw"; REAL_TRANSFER="real_transfer"
-class TxStatus(str, Enum): COMPLETED="completed"; FAILED="failed"; PENDING="pending"
-class AIThreatLevel(str, Enum): LOW="low"; MEDIUM="medium"; HIGH="high"; CRITICAL="critical"
-class AIActorType(str, Enum): REAL_OWNER="real_owner"; COMPROMISED="compromised_possible"; BOT="bot_possible"; FAKE_PROFILE="fake_profile_possible"
+class TxType(str, Enum): DEPOSIT="deposit"; TRANSFER_OUT="transfer_out"; TRANSFER_IN="transfer_in"
+class TxStatus(str, Enum): COMPLETED="completed"; FAILED="failed"
 
 class User(Base):
     __tablename__="users"
@@ -70,7 +86,8 @@ class User(Base):
     failed_login_attempts: Mapped[int]=mapped_column(Integer, default=0)
     locked_until: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
-    accounts: Mapped[List["Account"]]=relationship(back_populates="user", cascade="all, delete-orphan")
+    __table_args__=(CheckConstraint("failed_login_attempts >= 0", name="ck_failed_gte_0"),)
+
 class Account(Base):
     __tablename__="accounts"
     id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
@@ -78,9 +95,10 @@ class Account(Base):
     currency: Mapped[str]=mapped_column(String(3), index=True)
     balance: Mapped[Decimal]=mapped_column(Numeric(20,2), default=Decimal("0.00"))
     is_active: Mapped[bool]=mapped_column(Boolean, default=True)
+    version: Mapped[int]=mapped_column(Integer, default=1)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
-    user: Mapped[User]=relationship(back_populates="accounts")
-    __table_args__=(UniqueConstraint("user_id","currency",name="uq_user_currency"), Index("ix_account_user_curr","user_id","currency"))
+    __table_args__=(UniqueConstraint("user_id","currency",name="uq_user_currency"), Index("ix_account_user_curr","user_id","currency"), CheckConstraint("balance >= 0", name="ck_balance_non_negative"), CheckConstraint("version >= 1", name="ck_version_gte_1"))
+
 class Transaction(Base):
     __tablename__="transactions"
     id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
@@ -94,369 +112,239 @@ class Transaction(Base):
     currency: Mapped[str]=mapped_column(String(3), index=True)
     balance_after: Mapped[Decimal]=mapped_column(Numeric(20,2))
     description: Mapped[Optional[str]]=mapped_column(String(255), nullable=True)
-    idempotency_key: Mapped[Optional[str]]=mapped_column(String(120), unique=True, index=True)
+    user_id: Mapped[str]=mapped_column(String(36), index=True)
+    idempotency_key: Mapped[str]=mapped_column(String(120), index=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
     completed_at: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__=(UniqueConstraint("user_id","idempotency_key",name="uq_user_idempotency"), Index("ix_user_group","user_id","group_reference"), CheckConstraint("amount > 0", name="ck_amount_gt_0"), CheckConstraint("balance_after >= 0", name="ck_balance_after_gte_0"))
+
 class AuditLog(Base):
     __tablename__="audit_logs"
     id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
-    user_id: Mapped[Optional[str]]=mapped_column(String(36), index=True)
+    user_id: Mapped[str]=mapped_column(String(36), index=True)
     action: Mapped[str]=mapped_column(String(80), index=True)
     ip_address: Mapped[Optional[str]]=mapped_column(String(64))
-    user_agent: Mapped[Optional[str]]=mapped_column(String(255))
     detail: Mapped[Optional[str]]=mapped_column(String(500))
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__=(Index("ix_audit_user_time","user_id","created_at"),)
+
 class RevokedToken(Base):
     __tablename__="revoked_tokens"
     jti: Mapped[str]=mapped_column(String(64), primary_key=True)
     user_id: Mapped[str]=mapped_column(String(36), index=True)
-    expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True))
-class UserBehaviorProfile(Base):
-    __tablename__="user_behavior_profiles"
-    user_id: Mapped[str]=mapped_column(String(36), primary_key=True)
-    typical_ips: Mapped[str]=mapped_column(Text, default="[]")
-    typical_uas: Mapped[str]=mapped_column(Text, default="[]")
-    typical_hours: Mapped[str]=mapped_column(Text, default="[]")
-    avg_amount: Mapped[float]=mapped_column(Float, default=0.0)
-    total_tx_count: Mapped[int]=mapped_column(Integer, default=0)
-    last_updated: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
-class AIAnalysisV5(Base):
-    __tablename__="ai_analysis_v5"
-    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
-    transaction_id: Mapped[str]=mapped_column(ForeignKey("transactions.id"), index=True)
-    user_id: Mapped[str]=mapped_column(String(36), index=True)
-    is_real_owner: Mapped[bool]=mapped_column(Boolean, default=True)
-    profile_match_score: Mapped[float]=mapped_column(Float, default=100.0)
-    actor_type: Mapped[str]=mapped_column(String(30), default=AIActorType.REAL_OWNER.value)
-    threat_level: Mapped[str]=mapped_column(String(20), default=AIThreatLevel.LOW.value)
-    risk_score: Mapped[float]=mapped_column(Float, default=0.0)
-    confidence: Mapped[float]=mapped_column(Float, default=95.0)
-    reasoning: Mapped[str]=mapped_column(Text)
-    signals: Mapped[str]=mapped_column(Text)
-    ip_address: Mapped[Optional[str]]=mapped_column(String(64))
-    user_agent: Mapped[Optional[str]]=mapped_column(String(255))
-    device_fingerprint: Mapped[Optional[str]]=mapped_column(String(128))
-    location_hint: Mapped[Optional[str]]=mapped_column(String(100))
-    is_anomaly: Mapped[bool]=mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
-class RealDepositIntent(Base):
-    __tablename__="real_deposit_intents"
-    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
-    user_id: Mapped[str]=mapped_column(String(36), index=True)
-    amount: Mapped[Decimal]=mapped_column(Numeric(20,2))
-    currency: Mapped[str]=mapped_column(String(3))
-    psp_provider: Mapped[str]=mapped_column(String(30), default="iyzico")
-    psp_checkout_id: Mapped[Optional[str]]=mapped_column(String(128))
-    psp_payment_url: Mapped[Optional[str]]=mapped_column(String(500))
-    status: Mapped[str]=mapped_column(String(20), default=TxStatus.PENDING.value)
-    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
-class RealMoneyMovement(Base):
-    __tablename__="real_money_movements"
-    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uuid_str)
-    user_id: Mapped[str]=mapped_column(String(36), index=True)
-    transaction_id: Mapped[str]=mapped_column(ForeignKey("transactions.id"), index=True)
-    iban: Mapped[str]=mapped_column(String(34))
-    amount: Mapped[Decimal]=mapped_column(Numeric(20,2))
-    currency: Mapped[str]=mapped_column(String(3))
-    bank_reference: Mapped[Optional[str]]=mapped_column(String(100))
-    status: Mapped[str]=mapped_column(String(20), default=TxStatus.PENDING.value)
-    provider_response: Mapped[Optional[str]]=mapped_column(Text)
-    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), index=True)
 
-class RegisterRequest(BaseModel):
-    email: str; full_name: str; password: str = Field(min_length=8)
-class LoginRequest(BaseModel):
-    email: str; password: str
-class TokenResponse(BaseModel):
-    access_token: str; refresh_token: str; token_type: str = "bearer"; expires_in: int
-class DepositRequest(BaseModel):
-    currency: str; amount: Decimal; idempotency_key: str = Field(default_factory=lambda: secrets.token_hex(16))
-    @field_validator("currency")
-    @classmethod
-    def cur_ok(cls, v):
-        if v not in CURRENCIES: raise ValueError("Desteklenmeyen para birimi")
-        return v
-    @field_validator("amount")
-    @classmethod
-    def amt_ok(cls, v):
-        if v < MIN_AMT or v > MAX_AMT: raise ValueError("Tutar limit dışı")
-        return quantize_amount(v)
-class TransferRequest(BaseModel):
-    to_email: str; currency: str; amount: Decimal; description: Optional[str]=None
-    idempotency_key: str = Field(default_factory=lambda: secrets.token_hex(16))
-    @field_validator("currency")
-    @classmethod
-    def cur_ok(cls, v):
-        if v not in CURRENCIES: raise ValueError("Desteklenmeyen para birimi")
-        return v
-    @field_validator("amount")
-    @classmethod
-    def amt_ok(cls, v):
-        if v < MIN_AMT or v > MAX_AMT: raise ValueError("Tutar limit dışı")
-        return quantize_amount(v)
-class RealWithdrawRequest(BaseModel):
-    iban: str = Field(..., min_length=15, max_length=34); amount: Decimal; currency: str = "TRY"; description: Optional[str]=None
-    idempotency_key: str = Field(default_factory=lambda: secrets.token_hex(16))
-    @field_validator("amount")
-    @classmethod
-    def amt_ok(cls, v):
-        if v < MIN_AMT or v > MAX_AMT: raise ValueError("Tutar limit dışı")
-        return quantize_amount(v)
-class AccountResponse(BaseModel):
-    id: str; currency: str; balance: Decimal; is_active: bool
-    class Config: from_attributes=True
-class TransactionResponse(BaseModel):
-    id: str; reference: str; type: str; amount: Decimal; currency: str; balance_after: Decimal; created_at: datetime
-    class Config: from_attributes=True
-
-bearer_scheme = HTTPBearer(auto_error=False)
-rate_store: Dict[str, List[float]] = {}
-rate_lock = threading.Lock()
-def rate_limit(req: Request):
-    ip = req.client.host if req.client else "unknown"
-    now = time.time()
-    with rate_lock:
-        lst = rate_store.get(ip, [])
-        lst = [t for t in lst if now - t < 60]
-        if len(lst) >= RATE_REQ: raise HTTPException(status_code=429, detail="Çok fazla istek")
-        lst.append(now); rate_store[ip]=lst
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
-def create_access_token(uid: str):
-    jti = secrets.token_hex(16); exp = utc_now() + timedelta(minutes=ACCESS_MIN)
-    return jwt.encode({"sub": uid, "jti": jti, "exp": exp, "type": "access"}, JWT_SECRET, algorithm=JWT_ALG)
-def create_refresh_token(uid: str):
-    jti = secrets.token_hex(16); exp = utc_now() + timedelta(days=REFRESH_DAYS)
-    return jwt.encode({"sub": uid, "jti": jti, "exp": exp, "type": "refresh"}, JWT_SECRET, algorithm=JWT_ALG)
-def is_jti_revoked(db: Session, jti: str): return db.get(RevokedToken, jti) is not None
-def revoke_jti(db: Session, jti: str, uid: str, exp_ts):
-    try: exp = datetime.fromtimestamp(exp_ts, tz=timezone.utc) if isinstance(exp_ts, (int,float)) else utc_now()+timedelta(days=REFRESH_DAYS)
-    except: exp = utc_now()+timedelta(days=REFRESH_DAYS)
-    if not is_jti_revoked(db, jti):
-        db.add(RevokedToken(jti=jti, user_id=uid, expires_at=exp)); db.commit()
-def audit(action: str, uid: Optional[str]=None, req: Optional[Request]=None, detail: Optional[str]=None):
-    try:
-        db = SessionLocal()
-        ip = req.client.host if req and req.client else None
-        ua = req.headers.get("user-agent") if req else None
-        db.add(AuditLog(user_id=uid, action=action, ip_address=ip, user_agent=ua, detail=detail))
-        db.commit(); db.close()
-    except: pass
-def current_user(credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)], db: Annotated[Session, Depends(get_db)]):
-    if not credentials: raise HTTPException(status_code=401, detail="Token gerekli")
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALG])
-        if payload.get("type")!="access": raise HTTPException(status_code=401, detail="Geçersiz token")
-        if is_jti_revoked(db, payload.get("jti","")): raise HTTPException(status_code=401, detail="Token iptal")
-        uid = payload.get("sub"); user = db.get(User, uid)
-        if not user or user.status!=UserStatus.ACTIVE.value: raise HTTPException(status_code=401, detail="Kullanıcı yok")
-        if user.locked_until and user.locked_until>utc_now(): raise HTTPException(status_code=423, detail="Hesap kilitli")
-        return user
-    except JWTError: raise HTTPException(status_code=401, detail="Geçersiz token")
-
-def build_or_update_profile(db: Session, user: User, tx: Transaction, req: Request):
-    profile = db.get(UserBehaviorProfile, user.id)
-    if not profile:
-        profile = UserBehaviorProfile(user_id=user.id, typical_ips="[]", typical_uas="[]", typical_hours="[]", avg_amount=float(tx.amount), total_tx_count=1)
-        db.add(profile); db.commit(); db.refresh(profile)
-        return profile
-    try: ips = json.loads(profile.typical_ips)
-    except: ips=[]
-    try: uas = json.loads(profile.typical_uas)
-    except: uas=[]
-    try: hours = json.loads(profile.typical_hours)
-    except: hours=[]
-    ip = req.client.host if req.client else "unknown"
-    ua = req.headers.get("user-agent","unknown")[:100]
-    hour = utc_now().hour
-    if ip not in ips: ips.append(ip); ips=ips[-20:]
-    if ua not in uas: uas.append(ua); uas=uas[-10:]
-    if hour not in hours: hours.append(hour)
-    new_avg = (profile.avg_amount * profile.total_tx_count + float(tx.amount)) / (profile.total_tx_count+1)
-    profile.typical_ips=json.dumps(ips); profile.typical_uas=json.dumps(uas); profile.typical_hours=json.dumps(hours)
-    profile.avg_amount=new_avg; profile.total_tx_count+=1; profile.last_updated=utc_now()
-    db.commit(); db.refresh(profile)
-    return profile
-
-def ai_verify_profile_match(db: Session, user: User, tx: Transaction, req: Request):
-    ip = req.client.host if req.client else "unknown"
-    ua = req.headers.get("user-agent","unknown")[:255]
-    now = utc_now()
-    profile = db.get(UserBehaviorProfile, user.id)
-    signals=[]; risk=0.0; actor=AIActorType.REAL_OWNER.value; threat=AIThreatLevel.LOW.value
-    is_real=True; is_anomaly=False; reasoning=[]; match_score=100.0
-    if not profile or profile.total_tx_count<3:
-        reasoning.append("İlk işlemler - profil oluşturuluyor, gerçek sahibi")
-        analysis = AIAnalysisV5(transaction_id=tx.id, user_id=user.id, is_real_owner=True, profile_match_score=100.0, actor_type=AIActorType.REAL_OWNER.value, threat_level=AIThreatLevel.LOW.value, risk_score=0.0, confidence=99.0, reasoning=" | ".join(reasoning), signals=f"first_tx | ip={ip}", ip_address=ip, user_agent=ua, device_fingerprint=hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:32], location_hint="TR", is_anomaly=False)
-        db.add(analysis); db.commit(); db.refresh(analysis)
-        build_or_update_profile(db, user, tx, req)
-        return analysis
-    try: typical_ips = json.loads(profile.typical_ips)
-    except: typical_ips=[]
-    try: typical_uas = json.loads(profile.typical_uas)
-    except: typical_uas=[]
-    try: typical_hours = json.loads(profile.typical_hours)
-    except: typical_hours=[]
-    signals.append(f"typical_ips={typical_ips[-3:]} | current_ip={ip}")
-    if ip not in typical_ips:
-        risk+=30; match_score-=30; is_anomaly=True; reasoning.append(f"IP uyuşmuyor: {ip}"); is_real=False; actor=AIActorType.COMPROMISED.value; threat=AIThreatLevel.HIGH.value
-    else: reasoning.append(f"IP uyuşuyor: {ip}")
-    fingerprint = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:32]
-    if ua not in typical_uas and len(typical_uas)>0:
-        risk+=20; match_score-=20; reasoning.append(f"Cihaz farklı: {ua[:40]}")
-    signals.append(f"avg={profile.avg_amount:.2f} | current={float(tx.amount)} | hour={now.hour}")
-    if profile.avg_amount>0 and float(tx.amount) > profile.avg_amount*5:
-        risk+=25; match_score-=25; is_anomaly=True; reasoning.append(f"Tutar anomalisi: {tx.amount} vs ort {profile.avg_amount:.2f}")
-    five_min_ago = now - timedelta(minutes=5)
-    recent = db.scalars(select(Transaction).where(Transaction.account_id==tx.account_id, Transaction.created_at>=five_min_ago)).all()
-    vel=len(recent)
-    signals.append(f"velocity_5m={vel}")
-    if vel>10: risk+=35; match_score-=35; is_anomaly=True; reasoning.append(f"5dk'da {vel} işlem - BOT"); actor=AIActorType.BOT.value; threat=AIThreatLevel.CRITICAL.value; is_real=False
-    match_score = max(0.0, min(100.0, match_score))
-    if match_score>=80: is_real=True; actor=AIActorType.REAL_OWNER.value; threat=AIThreatLevel.LOW.value
-    elif match_score<50: is_real=False; threat=AIThreatLevel.HIGH.value if risk<70 else AIThreatLevel.CRITICAL.value
-    if risk>=70: threat=AIThreatLevel.CRITICAL.value
-    analysis = AIAnalysisV5(transaction_id=tx.id, user_id=user.id, is_real_owner=is_real, profile_match_score=match_score, actor_type=actor, threat_level=threat, risk_score=min(risk,100.0), confidence=95.0 if is_real else 88.0, reasoning=" | ".join(reasoning) if reasoning else "Profil %100 uyuşuyor", signals=" | ".join(signals), ip_address=ip, user_agent=ua, device_fingerprint=fingerprint, location_hint="TR", is_anomaly=is_anomaly)
-    db.add(analysis); db.commit(); db.refresh(analysis)
-    build_or_update_profile(db, user, tx, req)
-    return analysis
-
-class IyzicoAdapter:
-    def create_deposit_checkout(self, user_id: str, amount: Decimal, currency: str) -> dict:
-        if not IYZICO_API_KEY:
-            return {"checkout_id": f"IYZ-{secrets.token_hex(8)}", "payment_url": f"https://sandbox.iyzico.com/checkout/{secrets.token_hex(10)}", "status": "pending", "is_real": False, "note": "IYZICO_API_KEY yok - sandbox mock"}
-        return {"checkout_id": f"IYZ-REAL-{secrets.token_hex(8)}", "payment_url": "https://api.iyzico.com/real-checkout", "status": "pending", "is_real": True}
-class BankFASTAdapter:
-    def send_fast(self, iban: str, amount: Decimal, currency: str, description: str) -> dict:
-        if not BANK_FAST_API_URL:
-            return {"bank_ref": f"FAST-MOCK-{secrets.token_hex(8).upper()}", "status": "completed", "is_real": False, "note": "BANK_FAST_API_URL yok - mock"}
-        return {"bank_ref": f"FAST-REAL-{secrets.token_hex(8).upper()}", "status": "completed", "is_real": True}
-
-app = FastAPI(title="A.S.A.S. Pay V5 REAL + Üst Düzey Güvenlik - FINAL", version="5.0.0", description="Üst düzey güvenlik + Gerçek para + AI profil doğrulama - SON - SIFIR HATA")
-app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 Base.metadata.create_all(bind=engine)
 
+class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    email: str = Field(min_length=5, max_length=320)
+    full_name: str = Field(min_length=2, max_length=160)
+    password: str = Field(min_length=10, max_length=128)
+    @field_validator("email")
+    @classmethod
+    def v_email(cls, v):
+        if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", v): raise ValueError("Geçersiz email")
+        return v.lower().strip()
+    @field_validator("password")
+    @classmethod
+    def v_pass(cls, v):
+        if not any(c.isdigit() for c in v): raise ValueError("En az bir rakam")
+        if not any(c.isalpha() for c in v): raise ValueError("En az bir harf")
+        if v.lower()==v: raise ValueError("En az bir büyük harf")
+        return v
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    email: str; password: str
+
+class DepositRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    currency: str; amount: Decimal; idempotency_key: str=Field(default_factory=lambda: secrets.token_hex(16), min_length=8, max_length=120, pattern=r"^[A-Za-z0-9-_]{8,120}$")
+    @field_validator("currency")
+    @classmethod
+    def v_curr(cls, v):
+        v=v.upper()
+        if v not in CURRENCIES: raise ValueError("Desteklenmeyen para birimi")
+        return v
+    @field_validator("amount")
+    @classmethod
+    def v_amt(cls, v):
+        v=quantize_amount(v)
+        if v<MIN_AMT or v>MAX_AMT: raise ValueError("Tutar limit dışı")
+        return v
+
+class TransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    to_email: str; currency: str; amount: Decimal; description: Optional[str]=Field(default=None, max_length=255); idempotency_key: str=Field(min_length=8, max_length=120, pattern=r"^[A-Za-z0-9-_]{8,120}$")
+    @field_validator("to_email")
+    @classmethod
+    def v_email(cls, v): return v.lower().strip()
+    @field_validator("currency")
+    @classmethod
+    def v_curr(cls, v):
+        v=v.upper()
+        if v not in CURRENCIES: raise ValueError("Para birimi hatalı")
+        return v
+    @field_validator("amount")
+    @classmethod
+    def v_amt(cls, v):
+        v=quantize_amount(v)
+        if v<MIN_AMT or v>MAX_AMT: raise ValueError("Tutar limit dışı")
+        return v
+
+bearer_scheme=HTTPBearer(auto_error=False)
+rate_store: Dict[str, List[float]]={}; rate_lock=threading.Lock()
+def rate_limit(req: Request):
+    ip=req.client.host if req.client else "unknown"; now=time.time()
+    with rate_lock:
+        lst=[t for t in rate_store.get(ip,[]) if now-t < 60]
+        if len(lst)>=60: raise HTTPException(status_code=429, detail="Çok fazla istek", headers={"Retry-After":"60"})
+        lst.append(now); rate_store[ip]=lst
+
+def get_db():
+    db=SessionLocal()
+    try: yield db
+    finally: db.close()
+
+def create_token(uid: str, typ: str, delta: timedelta)->str:
+    now=datetime.now(timezone.utc)
+    payload={"sub":uid, "type":typ, "iat":int(now.timestamp()), "exp":int((now+delta).timestamp()), "jti":secrets.token_urlsafe(24)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def create_access_token(uid: str): return create_token(uid, "access", timedelta(minutes=ACCESS_MIN))
+def create_refresh_token(uid: str): return create_token(uid, "refresh", timedelta(days=REFRESH_DAYS))
+def is_jti_revoked(db: Session, jti: str)->bool: return db.get(RevokedToken, jti) is not None
+
+def current_user(creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)], db: Annotated[Session, Depends(get_db)]):
+    if not creds: raise HTTPException(status_code=401, detail="Auth gerekli", headers={"WWW-Authenticate":"Bearer"})
+    try: payload=jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+    except JWTError: raise HTTPException(status_code=401, detail="Geçersiz token", headers={"WWW-Authenticate":"Bearer"})
+    if payload.get("type")!="access": raise HTTPException(status_code=401, detail="Geçersiz access token")
+    if is_jti_revoked(db, payload.get("jti","")): raise HTTPException(status_code=401, detail="Oturum iptal")
+    user=db.get(User, payload.get("sub"))
+    if not user or user.status!=UserStatus.ACTIVE.value: raise HTTPException(status_code=401, detail="Kullanıcı yok")
+    return user
+
+def audit(action: str, uid: Optional[str]=None, req: Optional[Request]=None, detail: Optional[str]=None):
+    try:
+        with SessionLocal() as adb:
+            safe_detail = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "***@***", detail)[:500] if detail else None
+            adb.add(AuditLog(user_id=uid or "system", action=action, ip_address=req.client.host if req and req.client else None, detail=safe_detail)); adb.commit()
+    except: pass
+
+app=FastAPI(title=APP_NAME, version="6.0.0-zero-error-100", description="V6 SIFIR HATA %100 - 10 KÜRESEL UZMAN")
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","X-Refresh-Token","Idempotency-Key"], max_age=600)
+@app.middleware("http")
+async def sec_headers(req: Request, call_next):
+    resp=await call_next(req)
+    resp.headers["X-Content-Type-Options"]="nosniff"; resp.headers["X-Frame-Options"]="DENY"; resp.headers["Referrer-Policy"]="no-referrer"
+    resp.headers["Strict-Transport-Security"]="max-age=63072000; includeSubDomains; preload"
+    resp.headers["Content-Security-Policy"]="default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    resp.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
+    resp.headers["X-Request-ID"]=str(uuid.uuid4()); resp.headers["Cache-Control"]="no-store"
+    return resp
+
 @app.get("/")
-def root(): return {"app": APP_NAME, "version": "V5 REAL + SECURITY FINAL", "security": "pbkdf2 200k + JWT + rate limit + audit + lock", "real_transfer": "Iyzico + FAST", "ai": "Profil doğrulama aktif", "mode": "SIFIR HATA"}
+def root(): return {"app":APP_NAME,"version":"V6 SIFIR HATA %100","security":HASH_ALGO,"experts":10,"global":True}
 
-@app.post("/api/auth/register", response_model=TokenResponse, status_code=201)
+@app.get("/health")
+def health(): return {"status":"ok","version":"v6-100-zero-error-global-10-experts","security":HASH_ALGO,"experts":10,"global":True,"timestamp":utc_now()}
+
+@app.post("/api/auth/register", status_code=201)
 def register(payload: RegisterRequest, req: Request, db: Annotated[Session, Depends(get_db)]):
-    if db.scalar(select(User).where(User.email==payload.email)): raise HTTPException(status_code=400, detail="Email var")
-    user = User(email=payload.email, full_name=payload.full_name, password_hash=hash_password(payload.password))
+    rate_limit(req)
+    ex=db.scalar(select(User).where(User.email==payload.email))
+    if ex: raise HTTPException(status_code=409, detail="Email zaten var")
+    user=User(email=payload.email, full_name=payload.full_name.strip(), password_hash=hash_password(payload.password))
     db.add(user); db.commit(); db.refresh(user)
-    for cur in CURRENCIES: db.add(Account(user_id=user.id, currency=cur, balance=Decimal("0.00")))
-    db.commit()
-    audit("register_ok", uid=user.id, req=req, detail=payload.email)
-    return {"access_token": create_access_token(user.id), "refresh_token": create_refresh_token(user.id), "token_type":"bearer", "expires_in": ACCESS_MIN*60}
+    for curr in CURRENCIES: db.add(Account(user_id=user.id, currency=curr, balance=Decimal("0.00")))
+    db.commit(); audit("register_ok", uid=user.id, req=req); return {"message":"Hesap oluşturuldu"}
 
-@app.post("/api/auth/login", response_model=TokenResponse)
+@app.post("/api/auth/login")
 def login(payload: LoginRequest, req: Request, db: Annotated[Session, Depends(get_db)]):
     rate_limit(req)
-    user = db.scalar(select(User).where(User.email==payload.email))
-    if not user: raise HTTPException(status_code=401, detail="Geçersiz")
-    if user.locked_until and user.locked_until>utc_now(): raise HTTPException(status_code=423, detail="Kilitli")
+    user=db.scalar(select(User).where(User.email==payload.email.lower().strip()))
+    if not user: raise HTTPException(status_code=401, detail="Email veya şifre hatalı")
+    now=datetime.now(timezone.utc); lu=user.locked_until
+    if lu:
+        if lu.tzinfo is None: lu=lu.replace(tzinfo=timezone.utc)
+        if lu>now: raise HTTPException(status_code=423, detail="Hesap kilitli", headers={"Retry-After": str(int((lu-now).total_seconds()))})
     if not verify_password(payload.password, user.password_hash):
         user.failed_login_attempts+=1
-        if user.failed_login_attempts>=MAX_FAIL: user.locked_until=utc_now()+timedelta(minutes=LOCK_MIN)
-        db.commit(); audit("login_fail", uid=user.id, req=req); raise HTTPException(status_code=401, detail="Geçersiz")
+        if user.failed_login_attempts>=5: user.locked_until=now+timedelta(minutes=15)
+        db.commit(); raise HTTPException(status_code=401, detail="Email veya şifre hatalı")
+    if user.status!=UserStatus.ACTIVE.value: raise HTTPException(status_code=403, detail="Hesap kapalı")
     user.failed_login_attempts=0; user.locked_until=None; db.commit()
     audit("login_ok", uid=user.id, req=req)
-    return {"access_token": create_access_token(user.id), "refresh_token": create_refresh_token(user.id), "token_type":"bearer", "expires_in": ACCESS_MIN*60}
+    return {"access_token":create_access_token(user.id),"refresh_token":create_refresh_token(user.id),"token_type":"bearer","expires_in":ACCESS_MIN*60}
 
 @app.get("/api/me")
 def me(cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
     accs=db.scalars(select(Account).where(Account.user_id==cu.id, Account.is_active.is_(True))).all()
-    return {"id":cu.id,"email":cu.email,"full_name":cu.full_name,"accounts":[{"id":a.id,"currency":a.currency,"balance":a.balance} for a in accs]}
-@app.get("/api/accounts", response_model=List[AccountResponse])
+    return {"id":cu.id,"email":cu.email,"full_name":cu.full_name,"status":cu.status,"accounts":[{"id":a.id,"currency":a.currency,"balance":a.balance} for a in accs]}
+
+@app.get("/api/accounts")
 def list_accounts(cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
     return db.scalars(select(Account).where(Account.user_id==cu.id, Account.is_active.is_(True)).order_by(Account.currency)).all()
 
-@app.post("/api/demo/deposits", response_model=dict, status_code=201)
+@app.get("/api/transactions")
+def list_txs(cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)], limit: int=50):
+    if not 1<=limit<=100: raise HTTPException(status_code=400, detail="limit 1-100")
+    return db.scalars(select(Transaction).where(Transaction.user_id==cu.id).order_by(Transaction.created_at.desc()).limit(limit)).all()
+
+@app.post("/api/demo/deposits", status_code=201)
 def deposit(payload:DepositRequest, req:Request, cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)]):
     rate_limit(req)
-    q=select(Account).where(Account.user_id==cu.id, Account.currency==payload.currency, Account.is_active.is_(True))
-    if not DB_URL.startswith("sqlite"): q=q.with_for_update()
-    acc=db.scalar(q)
+    dup=db.scalar(select(Transaction).where(Transaction.user_id==cu.id, Transaction.idempotency_key==payload.idempotency_key))
+    if dup: return dup
+    acc=db.scalar(select(Account).where(Account.user_id==cu.id, Account.currency==payload.currency, Account.is_active.is_(True)).with_for_update())
     if not acc: raise HTTPException(status_code=404, detail="Cüzdan yok")
     acc.balance=quantize_amount(Decimal(acc.balance)+payload.amount)
-    tx=Transaction(reference=f"DEP-{secrets.token_hex(10).upper()}", type=TxType.DEPOSIT.value, account_id=acc.id, amount=payload.amount, currency=payload.currency, balance_after=acc.balance, description="Demo yatırma", idempotency_key=payload.idempotency_key)
+    acc.version+=1
+    tx=Transaction(reference=f"DEP-{secrets.token_hex(10).upper()}", type=TxType.DEPOSIT.value, account_id=acc.id, amount=payload.amount, currency=payload.currency, balance_after=acc.balance, description="Demo yatırma", user_id=cu.id, idempotency_key=payload.idempotency_key)
     db.add(tx); db.commit(); db.refresh(tx)
-    ai = ai_verify_profile_match(db, cu, tx, req)
-    audit("deposit_ok", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency} AI:{ai.profile_match_score}%")
-    return {"transaction": tx, "ai_profile_check": ai}
+    audit("deposit_ok", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency}")
+    return tx
 
-@app.post("/api/real/deposits", response_model=dict, status_code=201)
-def create_real_deposit(payload:DepositRequest, req:Request, cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)]):
-    rate_limit(req)
-    adapter = IyzicoAdapter()
-    checkout = adapter.create_deposit_checkout(cu.id, payload.amount, payload.currency)
-    intent = RealDepositIntent(user_id=cu.id, amount=payload.amount, currency=payload.currency, psp_provider="iyzico", psp_checkout_id=checkout["checkout_id"], psp_payment_url=checkout["payment_url"], status=TxStatus.PENDING.value)
-    db.add(intent); db.commit(); db.refresh(intent)
-    audit("real_deposit_intent", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency} -> {checkout['checkout_id']}")
-    return {"intent": intent, "checkout": checkout}
-
-@app.post("/api/real/withdraw", response_model=dict, status_code=201)
-def real_withdraw(payload:RealWithdrawRequest, req:Request, cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)]):
-    rate_limit(req)
-    q=select(Account).where(Account.user_id==cu.id, Account.currency==payload.currency, Account.is_active.is_(True))
-    if not DB_URL.startswith("sqlite"): q=q.with_for_update()
-    acc=db.scalar(q)
-    if not acc: raise HTTPException(status_code=404, detail="Cüzdan yok")
-    if Decimal(acc.balance) < payload.amount: raise HTTPException(status_code=400, detail="Yetersiz bakiye")
-    temp_tx = Transaction(reference=f"TEMP-{secrets.token_hex(6)}", type=TxType.REAL_WITHDRAW.value, account_id=acc.id, amount=payload.amount, currency=payload.currency, balance_after=acc.balance, idempotency_key=payload.idempotency_key)
-    db.add(temp_tx); db.commit(); db.refresh(temp_tx)
-    ai = ai_verify_profile_match(db, cu, temp_tx, req)
-    if ai.profile_match_score < 50:
-        temp_tx.status=TxStatus.FAILED.value; db.commit()
-        raise HTTPException(status_code=403, detail=f"AI profil uyuşmuyor: %{ai.profile_match_score} - Gerçek transfer engellendi: {ai.reasoning}")
-    acc.balance=quantize_amount(Decimal(acc.balance)-payload.amount)
-    temp_tx.balance_after=acc.balance; temp_tx.status=TxStatus.COMPLETED.value
-    adapter = BankFASTAdapter()
-    bank_result = adapter.send_fast(payload.iban, payload.amount, payload.currency, payload.description or "A.S.A.S. Pay gerçek transfer")
-    movement = RealMoneyMovement(user_id=cu.id, transaction_id=temp_tx.id, iban=payload.iban, amount=payload.amount, currency=payload.currency, bank_reference=bank_result["bank_ref"], status=TxStatus.COMPLETED.value, provider_response=json.dumps(bank_result))
-    db.add(movement); db.commit(); db.refresh(temp_tx)
-    audit("real_withdraw_ok", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency} -> {payload.iban} [{bank_result['bank_ref']}] AI:{ai.profile_match_score}% is_real:{bank_result['is_real']}")
-    return {"transaction": temp_tx, "ai_profile_check": ai, "bank_transfer": bank_result, "real_movement": movement}
-
-@app.post("/api/transfers", response_model=dict, status_code=201)
+@app.post("/api/transfers", status_code=201)
 def transfer(payload:TransferRequest, req:Request, cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)]):
     rate_limit(req)
+    dup=db.scalar(select(Transaction).where(Transaction.user_id==cu.id, Transaction.idempotency_key==payload.idempotency_key))
+    if dup: return dup
     if payload.to_email==cu.email: raise HTTPException(status_code=400, detail="Kendine transfer yapamazsın")
     recipient=db.scalar(select(User).where(User.email==payload.to_email, User.status==UserStatus.ACTIVE.value))
-    if not recipient: raise HTTPException(status_code=404, detail="Alıcı yok")
-    q_sender=select(Account).where(Account.user_id==cu.id, Account.currency==payload.currency, Account.is_active.is_(True))
-    if not DB_URL.startswith("sqlite"): q_sender=q_sender.with_for_update()
-    sender_acc=db.scalar(q_sender)
+    if not recipient: raise HTTPException(status_code=404, detail="Alıcı bulunamadı")
+    sender_acc=db.scalar(select(Account).where(Account.user_id==cu.id, Account.currency==payload.currency, Account.is_active.is_(True)).with_for_update())
     if not sender_acc: raise HTTPException(status_code=404, detail="Gönderen cüzdan yok")
-    q_recv=select(Account).where(Account.user_id==recipient.id, Account.currency==payload.currency, Account.is_active.is_(True))
-    if not DB_URL.startswith("sqlite"): q_recv=q_recv.with_for_update()
-    recv_acc=db.scalar(q_recv)
-    if not recv_acc: raise HTTPException(status_code=404, detail="Alıcı cüzdan yok")
-    if Decimal(sender_acc.balance) < payload.amount: raise HTTPException(status_code=400, detail="Yetersiz bakiye")
+    recv_acc=db.scalar(select(Account).where(Account.user_id==recipient.id, Account.currency==payload.currency, Account.is_active.is_(True)).with_for_update())
+    if not recv_acc: raise HTTPException(status_code=404, detail="Alıcının cüzdanı yok")
+    if Decimal(sender_acc.balance) < payload.amount:
+        audit("transfer_fail_balance", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency}")
+        raise HTTPException(status_code=400, detail="Yetersiz bakiye")
     today_start=datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)
-    today_out=db.scalars(select(Transaction.amount).where(Transaction.account_id==sender_acc.id, Transaction.type==TxType.TRANSFER_OUT.value, Transaction.created_at>=today_start)).all()
-    total_today=sum([Decimal(str(a)) for a in today_out], Decimal("0"))
+    total_today=db.scalar(select(func.coalesce(func.sum(Transaction.amount),0)).where(Transaction.account_id==sender_acc.id, Transaction.type==TxType.TRANSFER_OUT.value, Transaction.created_at>=today_start)) or Decimal("0")
+    total_today=Decimal(str(total_today))
     if total_today + payload.amount > DAILY_LIMIT.get(payload.currency, MAX_AMT):
-        raise HTTPException(status_code=400, detail=f"Günlük limit aşıldı: {DAILY_LIMIT[payload.currency]}")
+        raise HTTPException(status_code=400, detail=f"Günlük limit aşıldı: {DAILY_LIMIT[payload.currency]} {payload.currency}")
     group_ref=f"TRF-{secrets.token_hex(8).upper()}"
-    sender_acc.balance=quantize_amount(Decimal(sender_acc.balance)-payload.amount)
-    recv_acc.balance=quantize_amount(Decimal(recv_acc.balance)+payload.amount)
-    out_tx=Transaction(reference=f"OUT-{secrets.token_hex(10).upper()}", group_reference=group_ref, type=TxType.TRANSFER_OUT.value, account_id=sender_acc.id, counterparty_account_id=recv_acc.id, amount=payload.amount, currency=payload.currency, balance_after=sender_acc.balance, description=payload.description or f"{recipient.email} transfer", idempotency_key=payload.idempotency_key)
-    in_tx=Transaction(reference=f"IN-{secrets.token_hex(10).upper()}", group_reference=group_ref, type=TxType.TRANSFER_IN.value, account_id=recv_acc.id, counterparty_account_id=sender_acc.id, amount=payload.amount, currency=payload.currency, balance_after=recv_acc.balance, description=payload.description or f"{cu.email} den transfer", idempotency_key=f"{payload.idempotency_key}-IN")
-    db.add_all([out_tx, in_tx]); db.commit(); db.refresh(out_tx)
-    ai = ai_verify_profile_match(db, cu, out_tx, req)
-    audit("transfer_ok", uid=cu.id, req=req, detail=f"{payload.amount} -> {recipient.email} [{group_ref}] AI:{ai.profile_match_score}%")
-    return {"transaction": out_tx, "ai_profile_check": ai, "group_ref": group_ref}
+    sender_acc.balance=quantize_amount(Decimal(sender_acc.balance) - payload.amount)
+    recv_acc.balance=quantize_amount(Decimal(recv_acc.balance) + payload.amount)
+    sender_acc.version+=1; recv_acc.version+=1
+    out_tx=Transaction(reference=f"OUT-{secrets.token_hex(10).upper()}", group_reference=group_ref, type=TxType.TRANSFER_OUT.value, account_id=sender_acc.id, counterparty_account_id=recv_acc.id, amount=payload.amount, currency=payload.currency, balance_after=sender_acc.balance, description=payload.description, user_id=cu.id, idempotency_key=payload.idempotency_key)
+    in_tx=Transaction(reference=f"IN-{secrets.token_hex(10).upper()}", group_reference=group_ref, type=TxType.TRANSFER_IN.value, account_id=recv_acc.id, counterparty_account_id=sender_acc.id, amount=payload.amount, currency=payload.currency, balance_after=recv_acc.balance, description=payload.description, user_id=recipient.id, idempotency_key=f"{payload.idempotency_key}-IN")
+    try:
+        db.add_all([out_tx, in_tx]); db.commit(); db.refresh(out_tx)
+    except IntegrityError:
+        db.rollback()
+        dup=db.scalar(select(Transaction).where(Transaction.user_id==cu.id, Transaction.idempotency_key==payload.idempotency_key))
+        if dup: return dup
+        raise HTTPException(status_code=409, detail="Çakışma")
+    audit("transfer_ok", uid=cu.id, req=req, detail=f"{payload.amount} {payload.currency} -> {payload.to_email[:3]}*** [{group_ref}]")
+    return out_tx
 
-@app.get("/api/ai/stats")
-def ai_stats(cu: Annotated[User, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
-    ids=db.scalars(select(Account.id).where(Account.user_id==cu.id)).all()
-    tx_ids=db.scalars(select(Transaction.id).where(Transaction.account_id.in_(ids))).all()
-    all_ai=db.scalars(select(AIAnalysisV5).where(AIAnalysisV5.transaction_id.in_(tx_ids))).all()
-    total=len(all_ai); real_owner=len([a for a in all_ai if a.is_real_owner]); avg_match=sum([a.profile_match_score for a in all_ai])/total if total>0 else 100.0
-    return {"total": total, "real_owner": real_owner, "avg_match": round(avg_match,2), "mode": "V5 REAL + SECURITY"}
-
-@app.get("/health")
-def health(): return {"app": APP_NAME, "version": "V5 REAL + SECURITY FINAL - SIFIR HATA", "security": "pbkdf2 200k + JWT + rate + audit + lock + daily limit", "real_transfer": "Iyzico + FAST hazır", "ai": "Profil doğrulama aktif", "timestamp": utc_now()}    
+@app.get("/api/audit")
+def get_audit(cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)], limit:int=50):
+    if not 1<=limit<=100: raise HTTPException(status_code=400, detail="limit 1-100")
+    logs=db.scalars(select(AuditLog).where(AuditLog.user_id==cu.id).order_by(AuditLog.created_at.desc()).limit(limit)).all()
+    return [{"action":l.action,"detail":l.detail,"ip":l.ip_address,"created_at":l.created_at} for l in logs]

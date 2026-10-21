@@ -347,4 +347,4 @@ def transfer(payload:TransferRequest, req:Request, cu:Annotated[User,Depends(cur
 def get_audit(cu:Annotated[User,Depends(current_user)], db:Annotated[Session,Depends(get_db)], limit:int=50):
     if not 1<=limit<=100: raise HTTPException(status_code=400, detail="limit 1-100")
     logs=db.scalars(select(AuditLog).where(AuditLog.user_id==cu.id).order_by(AuditLog.created_at.desc()).limit(limit)).all()
-    return [{"action":l.action,"detail":l.detail,"ip":l.ip_address,"created_at":l.created_at} for l in logs]
+    return [{"action":l.action,"detail":l.detail,"ip":l.ip_address,"created_at":l.created_at} for l in logs] 
